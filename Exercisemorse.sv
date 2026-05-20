@@ -10,6 +10,7 @@ module Exercisemorse #(
     input           MAX10_CLK1_50,  // 50 HMz clock
     input  [1:0]    KEY,            // Buttons
     inout  [9:0]    ARDUINO_IO,     // Header pins
+    output          TXD,            // USB UART transmit
     output [9:0]    LEDR,           // LEDs
     input  [9:0]    SW,             // Switches
     output [7:0]    HEX0,           // 7-segment dieplay
@@ -39,16 +40,69 @@ module Exercisemorse #(
     logic [2:0]  data_len;
     logic        clear_data_len;
 
+    localparam logic [2:0] CMD_NONE  = 3'd0;
+    localparam logic [2:0] CMD_CHAR  = 3'd1;
+    localparam logic [2:0] CMD_WORD  = 3'd2;
+    localparam logic [2:0] CMD_MSG   = 3'd3;
+    localparam logic [2:0] CMD_CLEAR = 3'd4;
+
     logic uart_ready;
     logic uart_valid;
+    logic [7:0] uart_data;
     logic uart_tx_o;
+    logic uart_busy;
+    logic [2:0] uart_char_idx;
+    logic [2:0] uart_msg_len;
+    logic [2:0] uart_command;
+    logic [7:0] uart_symbol;
+    logic       uart_wait_ready_low;
+    logic [7:0] decoded_ascii;
     logic valid_seen;
     logic [2:0] last_command;
 
-    assign decoded_symbol = {valid_pulse, command_out, data_seq, data_len};
-    assign uart_valid     = valid_pulse && uart_ready;
+    assign decoded_ascii  = morse_to_ascii(data_seq, data_len);
+    assign decoded_symbol = {valid_pulse, command_out, decoded_ascii};
+    assign TXD            = uart_tx_o;
     assign ARDUINO_IO[0]  = uart_tx_o;
     assign ARDUINO_IO[9:1] = 9'bz;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            uart_valid    <= 1'b0;
+            uart_data     <= 8'h00;
+            uart_busy     <= 1'b0;
+            uart_char_idx <= 3'd0;
+            uart_msg_len  <= 3'd0;
+            uart_command  <= CMD_NONE;
+            uart_symbol   <= 8'h3f;
+            uart_wait_ready_low <= 1'b0;
+        end else begin
+            uart_valid <= 1'b0;
+
+            if (!uart_busy && valid_pulse) begin
+                uart_busy     <= 1'b1;
+                uart_char_idx <= 3'd0;
+                uart_msg_len  <= uart_len_for_command(command_out);
+                uart_command  <= command_out;
+                uart_symbol   <= decoded_ascii;
+            end else if (uart_wait_ready_low) begin
+                if (!uart_ready) begin
+                    uart_wait_ready_low <= 1'b0;
+                end
+            end else if (uart_busy && uart_ready) begin
+                uart_valid <= 1'b1;
+                uart_data  <= uart_byte_for_command(uart_command, uart_symbol, uart_char_idx);
+                uart_wait_ready_low <= 1'b1;
+
+                if (uart_char_idx + 3'd1 < uart_msg_len) begin
+                    uart_char_idx <= uart_char_idx + 3'd1;
+                end else begin
+                    uart_busy     <= 1'b0;
+                    uart_char_idx <= 3'd0;
+                end
+            end
+        end
+    end
 
     uart_tx #(
         .CLK_FREQ_HZ(CLK_FREQ_HZ),
@@ -56,7 +110,7 @@ module Exercisemorse #(
     ) i_uart_tx (
         .clk_i   (clk),
         .rst_ni  (rst_n),
-        .data_i  (decoded_symbol),
+        .data_i  (uart_data),
         .valid_i (uart_valid),
         .ready_o (uart_ready),
         .tx_o    (uart_tx_o)
@@ -79,11 +133,6 @@ module Exercisemorse #(
 //);
 
     // Constants
-    localparam logic [2:0] CMD_NONE  = 3'd0;
-    localparam logic [2:0] CMD_CHAR  = 3'd1;
-    localparam logic [2:0] CMD_WORD  = 3'd2;
-    localparam logic [2:0] CMD_MSG   = 3'd3;
-    localparam logic [2:0] CMD_CLEAR = 3'd4;
 
     // --- 1. PRESCALER (1ms Tick for 200MHz) ---
     logic [15:0] prescale_cnt;
@@ -105,7 +154,7 @@ module Exercisemorse #(
     assign LEDR[1] = s_btn;
     assign LEDR[2] = btn_control;
     assign LEDR[3] = c_btn;
-    assign LEDR[4:8] = data_seq;
+    assign LEDR[8:4] = data_seq;
     assign LEDR[9] = valid_seen;
 
     assign HEX0 = seven_seg(data_len);
@@ -251,6 +300,134 @@ module Exercisemorse #(
             4'h9: seven_seg = 8'b1001_0000;
             default: seven_seg = 8'b1111_1111;
         endcase
+    endfunction
+
+    function automatic logic [7:0] morse_to_ascii(
+        input logic [4:0] seq,
+        input logic [2:0] len
+    );
+        begin
+            morse_to_ascii = 8'h3f; // ?
+
+            case (len)
+                3'd1: begin
+                    case (seq[0])
+                        1'b0: morse_to_ascii = 8'h45; // E
+                        1'b1: morse_to_ascii = 8'h54; // T
+                    endcase
+                end
+
+                3'd2: begin
+                    case (seq[1:0])
+                        2'b00: morse_to_ascii = 8'h49; // I
+                        2'b01: morse_to_ascii = 8'h41; // A
+                        2'b10: morse_to_ascii = 8'h4e; // N
+                        2'b11: morse_to_ascii = 8'h4d; // M
+                    endcase
+                end
+
+                3'd3: begin
+                    case (seq[2:0])
+                        3'b000: morse_to_ascii = 8'h53; // S
+                        3'b001: morse_to_ascii = 8'h55; // U
+                        3'b010: morse_to_ascii = 8'h52; // R
+                        3'b011: morse_to_ascii = 8'h57; // W
+                        3'b100: morse_to_ascii = 8'h44; // D
+                        3'b101: morse_to_ascii = 8'h4b; // K
+                        3'b110: morse_to_ascii = 8'h47; // G
+                        3'b111: morse_to_ascii = 8'h4f; // O
+                    endcase
+                end
+
+                3'd4: begin
+                    case (seq[3:0])
+                        4'b0000: morse_to_ascii = 8'h48; // H
+                        4'b0001: morse_to_ascii = 8'h56; // V
+                        4'b0010: morse_to_ascii = 8'h46; // F
+                        4'b0100: morse_to_ascii = 8'h4c; // L
+                        4'b0110: morse_to_ascii = 8'h50; // P
+                        4'b0111: morse_to_ascii = 8'h4a; // J
+                        4'b1000: morse_to_ascii = 8'h42; // B
+                        4'b1001: morse_to_ascii = 8'h58; // X
+                        4'b1010: morse_to_ascii = 8'h43; // C
+                        4'b1011: morse_to_ascii = 8'h59; // Y
+                        4'b1100: morse_to_ascii = 8'h5a; // Z
+                        4'b1101: morse_to_ascii = 8'h51; // Q
+                    endcase
+                end
+
+                3'd5: begin
+                    case (seq[4:0])
+                        5'b01111: morse_to_ascii = 8'h31; // 1
+                        5'b00111: morse_to_ascii = 8'h32; // 2
+                        5'b00011: morse_to_ascii = 8'h33; // 3
+                        5'b00001: morse_to_ascii = 8'h34; // 4
+                        5'b00000: morse_to_ascii = 8'h35; // 5
+                        5'b10000: morse_to_ascii = 8'h36; // 6
+                        5'b11000: morse_to_ascii = 8'h37; // 7
+                        5'b11100: morse_to_ascii = 8'h38; // 8
+                        5'b11110: morse_to_ascii = 8'h39; // 9
+                        5'b11111: morse_to_ascii = 8'h30; // 0
+                    endcase
+                end
+            endcase
+        end
+    endfunction
+
+    function automatic logic [2:0] uart_len_for_command(input logic [2:0] command);
+        begin
+            case (command)
+                CMD_CHAR:  uart_len_for_command = 3'd1; // symbol
+                CMD_WORD:  uart_len_for_command = 3'd1; // word separator
+                CMD_MSG:   uart_len_for_command = 3'd2; // period + space
+                CMD_CLEAR: uart_len_for_command = 3'd5; // CLR + CR + LF
+                default:   uart_len_for_command = 3'd1; // ?
+            endcase
+        end
+    endfunction
+
+    function automatic logic [7:0] uart_byte_for_command(
+        input logic [2:0] command,
+        input logic [7:0] symbol,
+        input logic [2:0] idx
+    );
+        begin
+            uart_byte_for_command = 8'h3f; // ?
+
+            case (command)
+                CMD_CHAR: begin
+                    case (idx)
+                        3'd0: uart_byte_for_command = symbol;
+                        default: uart_byte_for_command = 8'h3f;
+                    endcase
+                end
+
+                CMD_WORD: begin
+                    case (idx)
+                        3'd0: uart_byte_for_command = 8'h20; // space
+                        default: uart_byte_for_command = 8'h3f;
+                    endcase
+                end
+
+                CMD_MSG: begin
+                    case (idx)
+                        3'd0: uart_byte_for_command = 8'h2e; // .
+                        3'd1: uart_byte_for_command = 8'h20; // space
+                        default: uart_byte_for_command = 8'h3f;
+                    endcase
+                end
+
+                CMD_CLEAR: begin
+                    case (idx)
+                        3'd0: uart_byte_for_command = 8'h43; // C
+                        3'd1: uart_byte_for_command = 8'h4c; // L
+                        3'd2: uart_byte_for_command = 8'h52; // R
+                        3'd3: uart_byte_for_command = 8'h0d;
+                        default: uart_byte_for_command = 8'h0a;
+                    endcase
+                end
+            endcase
+        end
     endfunction
 endmodule
 
